@@ -1,0 +1,10 @@
+[package]
+name = "sqlite_to_scylla"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rusqlite = "0.31.0" # SQLite library
+scylla = "0.13.0"    # ScyllaDB library
+tokio = { version = "1.0", features = ["full"] } # Asynchronous runtime
+serde = { version = "1.0.204", features = ["derive"] } # Add this line
