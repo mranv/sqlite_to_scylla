@@ -1,11 +1,7 @@
-use rusqlite::{params, Connection, Result};
-use scylla::{
-    Session, SessionBuilder, IntoTypedRows, QueryResult, SessionPager, QueryPager, FromRow,
-    error::QueryError,
-};
+use rusqlite::{Connection, Result};
+use scylla::{Session, SessionBuilder};
+use futures_util::stream::StreamExt; // Use futures_util for Stream
 use std::error::Error;
-use futures_util::stream::StreamExt;
-use tokio::stream::Stream;
 
 // Struct to hold table schema information
 #[derive(Debug)]
@@ -44,7 +40,7 @@ fn fetch_sqlite_schema(db_path: &str) -> Result<Vec<TableSchema>> {
 }
 
 // Function to create tables in ScyllaDB based on SQLite schema
-async fn create_scylla_tables(session: &Session, schema: &[TableSchema]) -> Result<(), QueryError> {
+async fn create_scylla_tables(session: &Session, schema: &[TableSchema]) -> Result<(), Box<dyn Error>> {
     for table in schema {
         let mut create_query = format!("CREATE TABLE IF NOT EXISTS {} (", table.table_name);
         for (i, (column_name, column_type)) in table.columns.iter().enumerate() {
@@ -69,13 +65,13 @@ async fn migrate_data(session: &Session, schema: &[TableSchema], db_path: &str) 
         let mut stmt = conn.prepare(&query)?;
         let rows = stmt.query_map([], |row| {
             let mut values: Vec<String> = Vec::new();
-            for i in 0..row.column_count() {
+            for i in 0..row.column_names().len() {
                 values.push(row.get::<usize, String>(i)?);
             }
             Ok(values)
         })?;
 
-        let mut batch = session.start_batch();
+        let mut batch = session.batch();
         for row in rows {
             let row = row?;
             let mut insert_query = format!("INSERT INTO {} (", table.table_name);
@@ -93,9 +89,9 @@ async fn migrate_data(session: &Session, schema: &[TableSchema], db_path: &str) 
                 insert_query.push_str(value);
             }
             insert_query.push_str(")");
-            batch.query(insert_query, ()).await?;
+            batch.append_statement(insert_query)?;
         }
-        batch.execute().await?;
+        session.execute_batch(batch).await?;
         println!("Data migrated for table {} to ScyllaDB", table.table_name);
     }
     Ok(())
@@ -104,8 +100,8 @@ async fn migrate_data(session: &Session, schema: &[TableSchema], db_path: &str) 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // Step 1: SQLite database path
-    let sqlite_db_path = "/home/mranv/Downloads/chinook.db";
-    
+    let sqlite_db_path = "/path/to/your/sqlite.db";
+
     // Step 2: Connect to SQLite and fetch schema
     let schema = fetch_sqlite_schema(sqlite_db_path)?;
 
