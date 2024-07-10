@@ -1,68 +1,128 @@
 use rusqlite::{params, Connection, Result};
-use serde::{Deserialize, Serialize};
-use scylla::{Session, SessionBuilder};
-use tokio;
+use scylla::{
+    Session, SessionBuilder, IntoTypedRows, QueryResult, SessionPager, QueryPager, FromRow,
+    error::QueryError,
+};
+use std::error::Error;
+use futures_util::stream::StreamExt;
+use tokio::stream::Stream;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct SampleData {
-    id: i32,
-    name: String,
-    value: String,
+// Struct to hold table schema information
+#[derive(Debug)]
+struct TableSchema {
+    table_name: String,
+    columns: Vec<(String, String)>,
 }
 
-fn read_sqlite_data(db_path: &str) -> Result<Vec<SampleData>> {
+// Function to retrieve schema information from SQLite
+fn fetch_sqlite_schema(db_path: &str) -> Result<Vec<TableSchema>> {
     let conn = Connection::open(db_path)?;
-    let mut stmt = conn.prepare("SELECT id, name, value FROM sample_table")?;
-    let sample_iter = stmt.query_map([], |row| {
-        Ok(SampleData {
-            id: row.get(0)?,
-            name: row.get(1)?,
-            value: row.get(2)?,
-        })
+    let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
+    let tables_iter = stmt.query_map([], |row| {
+        Ok(row.get(0)?)
     })?;
 
-    let mut samples = Vec::new();
-    for sample in sample_iter {
-        samples.push(sample?);
+    let mut tables = Vec::new();
+    for table_name in tables_iter {
+        let table_name: String = table_name?;
+        let mut stmt_columns = conn.prepare(&format!("PRAGMA table_info('{}')", table_name))?;
+        let columns_iter = stmt_columns.query_map([], |row| {
+            Ok((row.get(1)?, row.get(2)?))
+        })?;
+
+        let mut columns = Vec::new();
+        for column in columns_iter {
+            columns.push(column?);
+        }
+
+        tables.push(TableSchema {
+            table_name,
+            columns,
+        });
     }
-    Ok(samples)
+    Ok(tables)
 }
 
-async fn connect_to_scylla(node: &str) -> Result<Session, Box<dyn std::error::Error>> {
-    let session = SessionBuilder::new()
-        .known_node(node)
-        .build()
-        .await?;
-    Ok(session)
+// Function to create tables in ScyllaDB based on SQLite schema
+async fn create_scylla_tables(session: &Session, schema: &[TableSchema]) -> Result<(), QueryError> {
+    for table in schema {
+        let mut create_query = format!("CREATE TABLE IF NOT EXISTS {} (", table.table_name);
+        for (i, (column_name, column_type)) in table.columns.iter().enumerate() {
+            if i > 0 {
+                create_query.push_str(", ");
+            }
+            create_query.push_str(&format!("{} {}", column_name, column_type));
+        }
+        create_query.push_str(")");
+
+        session.query(create_query, ()).await?;
+        println!("Created table {} in ScyllaDB", table.table_name);
+    }
+    Ok(())
 }
 
-async fn insert_into_scylla(session: &Session, data: &[SampleData]) -> Result<(), Box<dyn std::error::Error>> {
-    for record in data {
-        session
-            .query(
-                "INSERT INTO keyspace_name.table_name (id, name, value) VALUES (?, ?, ?)",
-                (record.id, &record.name, &record.value),
-            )
-            .await?;
+// Function to migrate data from SQLite to ScyllaDB
+async fn migrate_data(session: &Session, schema: &[TableSchema], db_path: &str) -> Result<(), Box<dyn Error>> {
+    let conn = Connection::open(db_path)?;
+    for table in schema {
+        let query = format!("SELECT * FROM {}", table.table_name);
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map([], |row| {
+            let mut values: Vec<String> = Vec::new();
+            for i in 0..row.column_count() {
+                values.push(row.get::<usize, String>(i)?);
+            }
+            Ok(values)
+        })?;
+
+        let mut batch = session.start_batch();
+        for row in rows {
+            let row = row?;
+            let mut insert_query = format!("INSERT INTO {} (", table.table_name);
+            for (i, (column_name, _)) in table.columns.iter().enumerate() {
+                if i > 0 {
+                    insert_query.push_str(", ");
+                }
+                insert_query.push_str(column_name);
+            }
+            insert_query.push_str(") VALUES (");
+            for (i, value) in row.iter().enumerate() {
+                if i > 0 {
+                    insert_query.push_str(", ");
+                }
+                insert_query.push_str(value);
+            }
+            insert_query.push_str(")");
+            batch.query(insert_query, ()).await?;
+        }
+        batch.execute().await?;
+        println!("Data migrated for table {} to ScyllaDB", table.table_name);
     }
     Ok(())
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Step 1: Read data from SQLite
+async fn main() -> Result<(), Box<dyn Error>> {
+    // Step 1: SQLite database path
     let sqlite_db_path = "/home/mranv/Downloads/chinook.db";
-    let data = read_sqlite_data(sqlite_db_path)?;
-    println!("Read {} records from SQLite", data.len());
+    
+    // Step 2: Connect to SQLite and fetch schema
+    let schema = fetch_sqlite_schema(sqlite_db_path)?;
 
-    // Step 2: Connect to ScyllaDB
+    // Step 3: Connect to ScyllaDB
     let scylla_node = "127.0.0.1:9042";
-    let session = connect_to_scylla(scylla_node).await?;
-    println!("Connected to ScyllaDB");
+    let session = SessionBuilder::new()
+        .known_node(scylla_node)
+        .build()
+        .await?;
 
-    // Step 3: Insert data into ScyllaDB
-    insert_into_scylla(&session, &data).await?;
-    println!("Data migrated to ScyllaDB successfully");
+    // Step 4: Create tables in ScyllaDB
+    create_scylla_tables(&session, &schema).await?;
+
+    // Step 5: Migrate data from SQLite to ScyllaDB
+    migrate_data(&session, &schema, sqlite_db_path).await?;
+
+    println!("Migration completed successfully");
 
     Ok(())
 }

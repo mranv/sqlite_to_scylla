@@ -765,9 +765,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "sqlite_to_scylla"
+name = "sqlite-to-scylla-migration"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "futures-util",
  "rusqlite",
  "scylla",
  "serde",
